@@ -370,6 +370,8 @@ pub struct Niri {
     pub tablet_cursor_location: Option<Point<f64, Logical>>,
     pub gesture_swipe_3f_cumulative: Option<(f64, f64)>,
     pub overview_scroll_swipe_gesture: ScrollSwipeGesture,
+    pub continuous_scroll_swipe_gesture: ScrollSwipeGesture,
+    pub continuous_scroll_cumulative: Option<(f64, f64)>,
     pub vertical_wheel_tracker: ScrollTracker,
     pub horizontal_wheel_tracker: ScrollTracker,
     pub mods_with_mouse_binds: HashSet<Modifiers>,
@@ -2524,6 +2526,8 @@ impl Niri {
             tablet_cursor_location: None,
             gesture_swipe_3f_cumulative: None,
             overview_scroll_swipe_gesture: ScrollSwipeGesture::new(),
+            continuous_scroll_swipe_gesture: ScrollSwipeGesture::new(),
+            continuous_scroll_cumulative: None,
             vertical_wheel_tracker: ScrollTracker::new(120),
             horizontal_wheel_tracker: ScrollTracker::new(120),
             mods_with_mouse_binds,
@@ -3387,6 +3391,36 @@ impl Niri {
     pub fn output_under_cursor(&self) -> Option<Output> {
         let pos = self.seat.get_pointer().unwrap().current_location();
         self.global_space.output_under(pos).next().cloned()
+    }
+
+    /// Begin a swipe gesture based on direction.
+    ///
+    /// If `horizontal` is true, begins a view offset gesture (panning).
+    /// If `horizontal` is false, begins a workspace switch gesture.
+    pub fn begin_swipe_gesture(&mut self, horizontal: bool) {
+        let Some(output) = self.output_under_cursor() else {
+            return;
+        };
+
+        if horizontal {
+            let is_overview_open = self.layout.is_overview_open();
+            let output_ws = if is_overview_open {
+                self.workspace_under_cursor(true)
+            } else {
+                self.output_under_cursor().and_then(|output| {
+                    let mon = self.layout.monitor_for_output(&output)?;
+                    Some((output, mon.active_workspace_ref()))
+                })
+            };
+
+            if let Some((output, ws)) = output_ws {
+                let ws_idx = self.layout.find_workspace_by_id(ws.id()).unwrap().0;
+                self.layout
+                    .view_offset_gesture_begin(&output, Some(ws_idx), true);
+            }
+        } else {
+            self.layout.workspace_switch_gesture_begin(&output, true);
+        }
     }
 
     pub fn output_left_of(&self, current: &Output) -> Option<Output> {

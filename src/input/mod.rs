@@ -111,6 +111,34 @@ impl<D: SeatHandler> PointerOrTouchStartData<D> {
     }
 }
 
+/// Process swipe gesture cumulative tracking.
+///
+/// Accumulates deltas into the cumulative value and checks if the threshold is reached.ii
+/// Returns `Some(true)` for horizontal, `Some(false)` for vertical when threshold is reached,
+/// or `None` if still accumulating.
+fn process_swipe_cumulative(
+    cumulative: &mut Option<(f64, f64)>,
+    delta_x: f64,
+    delta_y: f64,
+) -> Option<bool> {
+    let (cx, cy) = cumulative.as_mut()?;
+
+    *cx += delta_x;
+    *cy += delta_y;
+
+    // Check if gesture moved far enough to decide direction.
+    // Threshold copied from GNOME Shell.
+    let (cx, cy) = (*cx, *cy);
+    if cx * cx + cy * cy < 16. * 16. {
+        return None;
+    }
+
+    *cumulative = None;
+
+    // true = horizontal, false = vertical
+    Some(cx.abs() > cy.abs())
+}
+
 impl State {
     pub fn process_input_event<I: InputBackend + 'static>(&mut self, event: InputEvent<I>)
     where
@@ -3287,7 +3315,7 @@ impl State {
         let vertical_amount = event.amount(Axis::Vertical);
 
         // Handle touchpad scroll bindings.
-        if source == AxisSource::Finger {
+        if source == AxisSource::Finger || source == AxisSource::Continuous {
             let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
             let modifiers = modifiers_from_state(mods);
 
@@ -3454,6 +3482,97 @@ impl State {
             } else {
                 self.niri.horizontal_finger_scroll_tracker.reset();
                 self.niri.vertical_finger_scroll_tracker.reset();
+            }
+        }
+
+        // Handle continuous scroll (trackball) with mod key as swipe gesture.
+        if source == AxisSource::Continuous {
+            let mods = self.niri.seat.get_keyboard().unwrap().modifier_state();
+            let modifiers = modifiers_from_state(mods);
+            let mod_down = modifiers.contains(mod_key.to_modifiers());
+
+            if mod_down {
+                let horizontal = horizontal_amount.unwrap_or(0.);
+                let vertical = vertical_amount.unwrap_or(0.);
+
+                // Track gesture state - this tells us if this is a new gesture.
+                let action = self
+                    .niri
+                    .continuous_scroll_swipe_gesture
+                    .update(horizontal, vertical);
+
+                // Initialize cumulative tracking only at the start of a new gesture.
+                if action.begin() {
+                    self.niri.continuous_scroll_cumulative = Some((0., 0.));
+                }
+
+                // Process like 3-finger swipe gesture - accumulate until threshold is reached.
+                if let Some(is_horizontal) = process_swipe_cumulative(
+                    &mut self.niri.continuous_scroll_cumulative,
+                    horizontal,
+                    vertical,
+                ) {
+                    self.niri.begin_swipe_gesture(is_horizontal);
+                }
+
+                let mut redraw = false;
+
+                if action.end() {
+                    // End both gestures - whichever is active will respond.
+                    redraw |= self
+                        .niri
+                        .layout
+                        .workspace_switch_gesture_end(Some(true))
+                        .is_some();
+                    redraw |= self
+                        .niri
+                        .layout
+                        .view_offset_gesture_end(Some(true))
+                        .is_some();
+                    self.niri.continuous_scroll_cumulative = None;
+                } else {
+                    // Update both gestures - whichever is active will respond.
+                    let res = self
+                        .niri
+                        .layout
+                        .workspace_switch_gesture_update(vertical, timestamp, true);
+                    if let Some(Some(_)) = res {
+                        redraw = true;
+                    }
+                    let res = self
+                        .niri
+                        .layout
+                        .view_offset_gesture_update(horizontal, timestamp, true);
+                    if let Some(Some(_)) = res {
+                        redraw = true;
+                    }
+                }
+
+                if redraw {
+                    self.niri.queue_redraw_all();
+                }
+
+                return;
+            } else {
+                // Mod key not held, end any ongoing continuous scroll gesture.
+                let mut redraw = false;
+                if self.niri.continuous_scroll_swipe_gesture.reset() {
+                    // End both gestures - whichever is active will respond.
+                    redraw |= self
+                        .niri
+                        .layout
+                        .workspace_switch_gesture_end(Some(true))
+                        .is_some();
+                    redraw |= self
+                        .niri
+                        .layout
+                        .view_offset_gesture_end(Some(true))
+                        .is_some();
+                }
+                self.niri.continuous_scroll_cumulative = None;
+                if redraw {
+                    self.niri.queue_redraw_all();
+                }
             }
         }
 
@@ -3825,43 +3944,10 @@ impl State {
             }
         }
 
-        let is_overview_open = self.niri.layout.is_overview_open();
-
-        if let Some((cx, cy)) = &mut self.niri.gesture_swipe_3f_cumulative {
-            *cx += delta_x;
-            *cy += delta_y;
-
-            // Check if the gesture moved far enough to decide. Threshold copied from GNOME Shell.
-            let (cx, cy) = (*cx, *cy);
-            if cx * cx + cy * cy >= 16. * 16. {
-                self.niri.gesture_swipe_3f_cumulative = None;
-
-                if let Some(output) = self.niri.output_under_cursor() {
-                    if cx.abs() > cy.abs() {
-                        let output_ws = if is_overview_open {
-                            self.niri.workspace_under_cursor(true)
-                        } else {
-                            // We don't want to accidentally "catch" the wrong workspace during
-                            // animations.
-                            self.niri.output_under_cursor().and_then(|output| {
-                                let mon = self.niri.layout.monitor_for_output(&output)?;
-                                Some((output, mon.active_workspace_ref()))
-                            })
-                        };
-
-                        if let Some((output, ws)) = output_ws {
-                            let ws_idx = self.niri.layout.find_workspace_by_id(ws.id()).unwrap().0;
-                            self.niri
-                                .layout
-                                .view_offset_gesture_begin(&output, Some(ws_idx), true);
-                        }
-                    } else {
-                        self.niri
-                            .layout
-                            .workspace_switch_gesture_begin(&output, true);
-                    }
-                }
-            }
+        if let Some(horizontal) =
+            process_swipe_cumulative(&mut self.niri.gesture_swipe_3f_cumulative, delta_x, delta_y)
+        {
+            self.niri.begin_swipe_gesture(horizontal);
         }
 
         let timestamp = Duration::from_micros(event.time());
